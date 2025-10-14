@@ -1,7 +1,9 @@
 import os
-from typing import List
+import json
+from typing import List, Dict, Any
 
 from .config import ChatConfig
+from .utils import list_tools as _list_tools, call_tool as _call_tool
 
 try:
     from openai import OpenAI  # type: ignore
@@ -25,19 +27,82 @@ class OpenAIBackend(BaseBackend):
         os.environ.setdefault("OPENAI_API_KEY", key)
         self.client = OpenAI()
 
+    def _build_openai_tools(self) -> List[Dict[str, Any]]:
+        """Convert registered tools into OpenAI tool specs."""
+        tools: List[Dict[str, Any]] = []
+        for t in _list_tools():
+            name = t.get("name")
+            if not name:
+                continue
+            desc = t.get("description") or ""
+            params = t.get("input_schema") or {"type": "object", "properties": {}}
+            # Ensure schema is a mapping; if not, wrap as empty object
+            if not isinstance(params, dict):
+                params = {"type": "object", "properties": {}}
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": desc,
+                    "parameters": params,
+                },
+            })
+        return tools
+
     def generate(self, system_prompt: str, user_prompt: str) -> str:
         try:
+            messages: List[Dict[str, Any]] = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ]
+            tools = self._build_openai_tools()
             resp = self.client.chat.completions.create(
                 model=self.cfg.model_name,
                 temperature=self.cfg.temperature,
                 top_p=self.cfg.top_p,
                 max_tokens=self.cfg.max_new_tokens,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_prompt},
-                ],
+                messages=messages,
+                tools=tools if tools else None,
+                tool_choice="auto" if tools else "none",
             )
-            return resp.choices[0].message.content.strip()
+            choice = resp.choices[0]
+            msg = choice.message
+            # If model requested a tool call, execute at most one and provide the result
+            tool_calls = getattr(msg, "tool_calls", None) or []
+            if tool_calls:
+                tc = tool_calls[0]
+                fn = getattr(tc, "function", None)
+                name = getattr(fn, "name", None) if fn else None
+                arg_str = getattr(fn, "arguments", "{}") if fn else "{}"
+                kwargs: Dict[str, Any]
+                try:
+                    kwargs = json.loads(arg_str) if arg_str else {}
+                    if not isinstance(kwargs, dict):
+                        kwargs = {}
+                except Exception:
+                    kwargs = {}
+                # Log the tool call for user visibility
+                try:
+                    pretty_args = json.dumps(kwargs)
+                except Exception:
+                    pretty_args = str(kwargs)
+                print(f"[Tool call] {name} {pretty_args}")
+                result = _call_tool(name, **kwargs) if name else None
+                tool_content = json.dumps((result.to_json() if result else {"ok": False, "error": "invalid tool"}))
+                # Append assistant msg (with tool_calls) and the tool result
+                messages.append({"role": "assistant", "content": msg.content or "", "tool_calls": [tc]})
+                messages.append({"role": "tool", "tool_call_id": getattr(tc, "id", ""), "content": tool_content})
+                # One follow-up to get final answer
+                resp2 = self.client.chat.completions.create(
+                    model=self.cfg.model_name,
+                    temperature=self.cfg.temperature,
+                    top_p=self.cfg.top_p,
+                    max_tokens=self.cfg.max_new_tokens,
+                    messages=messages,
+                )
+                return (resp2.choices[0].message.content or "").strip()
+            # No tool call; just return content
+            return (msg.content or "").strip()
         except Exception as e:  # pragma: no cover
             return f"[OpenAI error: {e}]"
 

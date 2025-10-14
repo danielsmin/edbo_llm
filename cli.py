@@ -57,6 +57,8 @@ def run_cli(space: SearchSpace, cfg: ChatConfig):
     - "space" holds the features/labels and preview of the loaded CSV.
     - "cfg" selects the LLM provider/model and runtime generation settings.
     """
+    # Permanently suppress HuggingFace tokenizers parallelism fork warnings
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     backend = build_backend(cfg)  # pick OpenAI or Gemini backend
     print("EDBO Chatbot. Type 'exit' or 'quit' to leave. ':help' for commands.")
     print(f"Model: {cfg.model_name}")

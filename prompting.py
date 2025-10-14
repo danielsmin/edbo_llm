@@ -17,6 +17,11 @@ Grounded code policy:
 - Favor edbo.plus.optimizer_botorch.EDBOplus().run(...) for running rounds; avoid direct calls to internal helpers (e.g., build_and_optimize_model).
 - If the needed API isn’t found in retrieved context, ask a brief clarification instead of guessing.
 When the user asks for code, ensure the snippet is self-contained and complete (imports, object creation, minimal params) and keep it under ~30 lines. Do not cut off mid-sentence.
+
+Tool use policy:
+- Call a tool when the question requires precise numeric results from a CSV or computation that cannot be reliably inferred from text.
+- If a suitable tool exists, respond with a single tool call (OpenAI function call) with JSON args; otherwise answer directly.
+- Prefer at most one tool hop. After a tool returns, summarize the result succinctly and include provenance (e.g., which file/column).
 """.strip()
 
 
