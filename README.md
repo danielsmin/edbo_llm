@@ -15,11 +15,6 @@ A lightweight, code-first CLI for chatting with an LLM over an experimental desi
 - `descriptors.py` — Loads descriptor definitions (if present) to enrich `:describe <feature>` and augment prompts.
 - `utils.py` — Tool registry: `@register_tool` decorator, `list_tools`, `call_tool`, JSON-safe result wrapper (`ToolResult`). Includes example tools.
 
-## Removed / deprecated
-
-- `code_summary.py` — No longer used; the minimal project root helper is inlined into `cli.py`.
-- `llm.py` — Deprecated redundant entry point. Use `python -m edbo.llm` instead of `python -m edbo.llm.llm`.
-
 ## Run
 
 OpenAI example:
@@ -31,12 +26,6 @@ python -m edbo.llm \
   --label-cols yield,cost \
   --provider openai \
   --model gpt-4o-mini
-```
-
-Disable RAG if dependencies aren’t installed:
-
-```bash
-python -m edbo.llm ... --rag-disable
 ```
 
 Gemini example:
@@ -56,13 +45,7 @@ python -m edbo.llm \
 - `--label-cols`: Comma-separated labels/objectives present in the CSV (e.g., `yield,ee`).
 - `--provider`: `openai` (default) or `gemini`.
 - `--model`: Model name (e.g., `gpt-4o`, `gpt-4o-mini`, `gemini-1.5-flash`).
-- `--rag-disable`: Disable local RAG (Chroma + MiniLM embeddings).
-- `--rag-top-k`: How many retrieved chunks to include when RAG is enabled.
-
-RAG indexing options (when enabled):
-- `--rag-code-dirs`: Comma-separated directories to index (relative to project root). If omitted, the project root is used.
-- `--rag-code-glob`: File pattern to index (default: `*.py`).
-- `--rag-exclude`: Comma-separated substrings to skip (e.g., `__pycache__,.ipynb_checkpoints`).
+  
 
 ## REPL commands
 
@@ -100,7 +83,7 @@ Note: Auto tool use can slightly increase token usage due to tool schemas and an
 
 ## Add your own tools
 
-Use the decorator (minimal):
+Use the decorator:
 
 ```python
 from edbo.llm.utils import register_tool
@@ -111,15 +94,7 @@ def my_tool(x: int, y: int) -> dict:
     return {"sum": x + y}
 ```
 
-Or bulk-register plain functions without decorators:
-
-```python
-# Example: we can add a helper like register_tools({"foo": foo, "bar": bar}) if you prefer.
-# Ask us to wire it and the CLI will see them under :tools / :call as well.
-```
-
 ## Tips
 
 - To silence tokenizer fork warnings, the CLI sets `TOKENIZERS_PARALLELISM=false`.
 - Keep CSV paths absolute to avoid ambiguity when calling tools.
-- If RAG is not installed or desired, pass `--rag-disable`.

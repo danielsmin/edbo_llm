@@ -268,7 +268,6 @@ def parse_args():
     p.add_argument("--max-new-tokens", type=int, default=256)
     p.add_argument("--temperature", type=float, default=0.3)
     p.add_argument("--top-p", type=float, default=0.9)
-    p.add_argument("--rag-disable", action="store_true", help="Disable local RAG cache and retrieval")
     p.add_argument("--rag-top-k", type=int, default=4, help="Top-k retrieved chunks to include from RAG")
     return p.parse_args()
 
@@ -288,7 +287,7 @@ def main():
         temperature=args.temperature,
         top_p=args.top_p,
         openai_api_key=args.openai_api_key,
-        rag_enable=(not args.rag_disable),
+        rag_enable=True,
         rag_top_k=max(0, int(args.rag_top_k)),
         provider=args.provider,
         gemini_api_key=args.gemini_api_key,
