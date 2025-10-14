@@ -328,3 +328,406 @@ def best_predictions(csv_path: str) -> dict:
     }
     return res
 
+
+# ---------------- Data helpers for additional tools ---------------- #
+
+
+def _load_df(csv_path: str):
+    import pandas as pd  # type: ignore
+    df = pd.read_csv(csv_path)
+    return df
+
+
+def _ensure_artifacts_dir() -> Path:
+    out_dir = Path.cwd() / ".edbo_llm_artifacts"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def _save_fig(plt, name: str) -> str:
+    out_dir = _ensure_artifacts_dir()
+    path = out_dir / f"{name}.png"
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
+    return str(path)
+
+
+# ---------------- Additional analysis/visualization tools ---------------- #
+
+
+@register_tool(
+    description="List unique values and counts for a column.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "csv_path": {"type": "string"},
+            "column": {"type": "string"},
+            "top_n": {"type": "integer"},
+        },
+        "required": ["csv_path", "column"],
+    },
+)
+def feature_values(csv_path: str, column: str, top_n: int = 50) -> dict:
+    import pandas as pd  # type: ignore
+    df = _load_df(csv_path)
+    if column not in df.columns:
+        raise ValueError(f"Column not found: {column}")
+    counts = df[column].value_counts(dropna=False).head(int(top_n))
+    return {
+        "column": column,
+        "distinct": int(df[column].nunique(dropna=False)),
+        "top": [{"value": (None if pd.isna(k) else ensure_json_safe(k)), "count": int(v)} for k, v in counts.items()],
+    }
+
+
+@register_tool(
+    description="Summary stats for a numeric label column (min/mean/median/max/std/quantiles).",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "csv_path": {"type": "string"},
+            "label": {"type": "string"},
+        },
+        "required": ["csv_path", "label"],
+    },
+)
+def label_stats(csv_path: str, label: str) -> dict:
+    import pandas as pd  # type: ignore
+    df = _load_df(csv_path)
+    if label not in df.columns:
+        raise ValueError(f"Label not found: {label}")
+    s = pd.to_numeric(df[label], errors="coerce").dropna()
+    if s.empty:
+        raise ValueError(f"Label has no numeric values: {label}")
+    q = s.quantile([0.05, 0.25, 0.5, 0.75, 0.95]).to_dict()
+    return {
+        "label": label,
+        "count": int(s.count()),
+        "mean": float(s.mean()),
+        "std": float(s.std()),
+        "min": float(s.min()),
+        "median": float(s.median()),
+        "max": float(s.max()),
+        "quantiles": {str(k): float(v) for k, v in q.items()},
+    }
+
+
+@register_tool(
+    description="Histogram of a numeric label column; returns image path to PNG.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "csv_path": {"type": "string"},
+            "label": {"type": "string"},
+            "bins": {"type": "integer"},
+        },
+        "required": ["csv_path", "label"],
+    },
+)
+def plot_label_hist(csv_path: str, label: str, bins: int = 30) -> dict:
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception as e:
+        raise RuntimeError(f"matplotlib is required: {e}")
+    import pandas as pd  # type: ignore
+    df = _load_df(csv_path)
+    if label not in df.columns:
+        raise ValueError(f"Label not found: {label}")
+    s = pd.to_numeric(df[label], errors="coerce").dropna()
+    fig = plt.figure(figsize=(6, 4))
+    plt.hist(s, bins=int(bins), color="#4C78A8", edgecolor="white")
+    plt.title(f"Histogram of {label}")
+    plt.xlabel(label)
+    plt.ylabel("count")
+    path = _save_fig(plt, f"hist_{label}")
+    return {"image_path": path, "label": label}
+
+
+@register_tool(
+    description="Plot feature vs label: scatter for numeric feature, boxplot for categorical. Returns image path.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "csv_path": {"type": "string"},
+            "feature": {"type": "string"},
+            "label": {"type": "string"},
+        },
+        "required": ["csv_path", "feature", "label"],
+    },
+)
+def plot_feature_vs_label(csv_path: str, feature: str, label: str) -> dict:
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception as e:
+        raise RuntimeError(f"matplotlib is required: {e}")
+    import pandas as pd  # type: ignore
+    df = _load_df(csv_path)
+    if feature not in df.columns or label not in df.columns:
+        raise ValueError("feature or label not found in CSV")
+    f = df[feature]
+    y = pd.to_numeric(df[label], errors="coerce")
+    fig = plt.figure(figsize=(6, 4))
+    if pd.api.types.is_numeric_dtype(f):
+        plt.scatter(f, y, s=18, alpha=0.75, color="#4C78A8")
+        plt.xlabel(feature)
+        plt.ylabel(label)
+        plt.title(f"{feature} vs {label}")
+    else:
+        # Boxplot per category (limit to first 30 categories)
+        cats = f.astype(str).fillna("NA")
+        order = cats.value_counts().index.tolist()[:30]
+        data = [y[cats == c].dropna().values for c in order]
+        plt.boxplot(data, labels=order, showmeans=True)
+        plt.xticks(rotation=45, ha="right")
+        plt.ylabel(label)
+        plt.title(f"{feature} vs {label} (boxplot)")
+    path = _save_fig(plt, f"feature_vs_label_{feature}_{label}")
+    return {"image_path": path, "feature": feature, "label": label}
+
+
+@register_tool(
+    description="Correlation heatmap for numeric columns; returns image path and top correlated pairs.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "csv_path": {"type": "string"},
+            "columns": {"type": "array", "items": {"type": "string"}},
+            "top_k_pairs": {"type": "integer"},
+        },
+        "required": ["csv_path"],
+    },
+)
+def correlation_heatmap(csv_path: str, columns: list | None = None, top_k_pairs: int = 10) -> dict:
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception as e:
+        raise RuntimeError(f"matplotlib is required: {e}")
+    import pandas as pd  # type: ignore
+    df = _load_df(csv_path)
+    if columns:
+        use = [c for c in columns if c in df.columns]
+    else:
+        use = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if not use:
+        raise ValueError("No numeric columns to correlate.")
+    corr = df[use].corr(numeric_only=True)
+    fig = plt.figure(figsize=(max(6, 0.4*len(use)), max(5, 0.4*len(use))))
+    im = plt.imshow(corr.values, cmap="coolwarm", vmin=-1, vmax=1)
+    plt.colorbar(im, fraction=0.046, pad=0.04)
+    plt.xticks(range(len(use)), use, rotation=60, ha="right", fontsize=8)
+    plt.yticks(range(len(use)), use, fontsize=8)
+    plt.title("Correlation heatmap")
+    path = _save_fig(plt, "correlation_heatmap")
+    # top pairs by absolute correlation (excluding diagonal)
+    pairs = []
+    for i, a in enumerate(use):
+        for j, b in enumerate(use):
+            if j <= i:
+                continue
+            val = corr.iloc[i, j]
+            if pd.isna(val):
+                continue
+            pairs.append({"a": a, "b": b, "corr": float(val), "abs_corr": float(abs(val))})
+    pairs.sort(key=lambda x: x["abs_corr"], reverse=True)
+    return {"image_path": path, "top_pairs": pairs[: int(top_k_pairs)]}
+
+
+@register_tool(
+    description="Pareto front for two objectives (maximize both); returns image path and indices.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "csv_path": {"type": "string"},
+            "x_col": {"type": "string", "description": "e.g., yield_predicted_mean"},
+            "y_col": {"type": "string", "description": "e.g., ee_predicted_mean"},
+        },
+        "required": ["csv_path", "x_col", "y_col"],
+    },
+)
+def pareto_front(csv_path: str, x_col: str, y_col: str) -> dict:
+    try:
+        import matplotlib.pyplot as plt  # type: ignore
+    except Exception as e:
+        raise RuntimeError(f"matplotlib is required: {e}")
+    import pandas as pd  # type: ignore
+    df = _load_df(csv_path)
+    if x_col not in df.columns or y_col not in df.columns:
+        raise ValueError("x_col or y_col not found in CSV")
+    x = pd.to_numeric(df[x_col], errors="coerce")
+    y = pd.to_numeric(df[y_col], errors="coerce")
+    valid = (~x.isna()) & (~y.isna())
+    X = x[valid].values
+    Y = y[valid].values
+    idxs = x[valid].index.tolist()
+    # Compute Pareto (maximize both)
+    order = sorted(range(len(X)), key=lambda i: (-X[i], -Y[i]))
+    pareto = []
+    best_y = float("-inf")
+    for i in order:
+        if Y[i] >= best_y:
+            pareto.append(i)
+            best_y = Y[i]
+    pareto_indices = [int(idxs[i]) for i in pareto]
+    # Plot
+    fig = plt.figure(figsize=(6, 4))
+    plt.scatter(X, Y, s=14, alpha=0.5, color="#9ecae1", label="all")
+    plt.scatter([X[i] for i in pareto], [Y[i] for i in pareto], s=24, color="#08519c", label="Pareto")
+    plt.xlabel(x_col)
+    plt.ylabel(y_col)
+    plt.title("Pareto front (maximize both)")
+    plt.legend()
+    path = _save_fig(plt, f"pareto_{x_col}_{y_col}")
+    return {"image_path": path, "pareto_indices": pareto_indices}
+
+
+@register_tool(
+    description="Top-N rows by a metric column (max or min).",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "csv_path": {"type": "string"},
+            "metric_column": {"type": "string"},
+            "n": {"type": "integer"},
+            "prefer": {"type": "string", "enum": ["max", "min"]},
+        },
+        "required": ["csv_path", "metric_column"],
+    },
+)
+def top_n_by_metric(csv_path: str, metric_column: str, n: int = 10, prefer: str = "max") -> dict:
+    import pandas as pd  # type: ignore
+    df = _load_df(csv_path)
+    if metric_column not in df.columns:
+        raise ValueError(f"Metric column not found: {metric_column}")
+    s = pd.to_numeric(df[metric_column], errors="coerce")
+    valid = s.dropna()
+    if valid.empty:
+        raise ValueError("Metric column has no numeric values")
+    if prefer == "min":
+        order = valid.sort_values(ascending=True).head(int(n))
+    else:
+        order = valid.sort_values(ascending=False).head(int(n))
+    rows = []
+    for idx, val in order.items():
+        rows.append({"row_index": int(idx), "value": float(val)})
+    return {"metric": metric_column, "prefer": prefer, "rows": rows}
+
+
+@register_tool(
+    description="Group mean of a label by a categorical feature; returns table of category, count, mean.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "csv_path": {"type": "string"},
+            "feature": {"type": "string"},
+            "label": {"type": "string"},
+        },
+        "required": ["csv_path", "feature", "label"],
+    },
+)
+def group_mean_label_by_feature(csv_path: str, feature: str, label: str) -> dict:
+    import pandas as pd  # type: ignore
+    df = _load_df(csv_path)
+    if feature not in df.columns or label not in df.columns:
+        raise ValueError("feature or label not found in CSV")
+    y = pd.to_numeric(df[label], errors="coerce")
+    cats = df[feature].astype(str).fillna("NA")
+    g = (
+        pd.DataFrame({"cat": cats, "y": y})
+        .dropna(subset=["y"]) 
+        .groupby("cat")
+        .agg(count=("y", "count"), mean=("y", "mean"))
+        .sort_values("mean", ascending=False)
+    )
+    out = [{"category": k, "count": int(v["count"]), "mean": float(v["mean"]) } for k, v in g.to_dict(orient="index").items()]
+    return {"feature": feature, "label": label, "groups": out}
+
+
+@register_tool(
+    description="Describe a row's reaction conditions by index, excluding prediction columns by default.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "csv_path": {"type": "string"},
+            "row_index": {"type": "integer"},
+            "exclude_suffixes": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Column name suffixes to exclude",
+            },
+            "exclude_columns": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["csv_path", "row_index"],
+    },
+)
+def describe_row(
+    csv_path: str,
+    row_index: int,
+    exclude_suffixes: Optional[List[str]] = None,
+    exclude_columns: Optional[List[str]] = None,
+) -> dict:
+    import pandas as pd  # type: ignore
+    df = _load_df(csv_path)
+    if row_index not in df.index:
+        raise ValueError(f"Row index not found: {row_index}")
+    row = df.loc[row_index]
+    if exclude_suffixes is None:
+        exclude_suffixes = [
+            "_predicted_mean",
+            "_predicted_variance",
+            "_expected_improvement",
+        ]
+    if exclude_columns is None:
+        exclude_columns = []
+    conditions = {}
+    for c, v in row.items():
+        if c in exclude_columns:
+            continue
+        if any(str(c).endswith(suf) for suf in exclude_suffixes):
+            continue
+        conditions[str(c)] = ensure_json_safe(v)
+    return {"row_index": int(row_index), "conditions": conditions}
+
+
+@register_tool(
+    description="Compare two rows and report differing conditions; excludes prediction columns by default.",
+    input_schema={
+        "type": "object",
+        "properties": {
+            "csv_path": {"type": "string"},
+            "row_a": {"type": "integer"},
+            "row_b": {"type": "integer"},
+        },
+        "required": ["csv_path", "row_a", "row_b"],
+    },
+)
+def compare_rows(csv_path: str, row_a: int, row_b: int) -> dict:
+    import pandas as pd  # type: ignore
+    df = _load_df(csv_path)
+    if row_a not in df.index or row_b not in df.index:
+        raise ValueError("row_a or row_b not in DataFrame index")
+    ra = df.loc[row_a]
+    rb = df.loc[row_b]
+    exclude_suffixes = ["_predicted_mean", "_predicted_variance", "_expected_improvement"]
+    diffs = []
+    for c in df.columns:
+        if any(str(c).endswith(suf) for suf in exclude_suffixes):
+            continue
+        va = ra[c]
+        vb = rb[c]
+        # Treat NaN equality
+        try:
+            na = pd.isna(va)
+            nb = pd.isna(vb)
+        except Exception:
+            na = False
+            nb = False
+        equal = (na and nb) or (va == vb)
+        if not equal:
+            diffs.append({
+                "column": str(c),
+                "row_a": ensure_json_safe(va),
+                "row_b": ensure_json_safe(vb),
+            })
+    return {"row_a": int(row_a), "row_b": int(row_b), "differences": diffs}
+

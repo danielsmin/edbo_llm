@@ -127,7 +127,7 @@ def run_cli(space: SearchSpace, cfg: ChatConfig):
             cmd = user[1:].strip().lower()
             if cmd == "help":
                 # Lightweight REPL commands for quick inspection
-                print("Commands: :help, :features, :labels, :preview, :model, :describe <feature>, :tools, :call <tool> <json-kwargs>, :best-preds [csv_path]")
+                print("Commands: :help, :features, :labels, :preview, :model, :describe <feature>, :tools, :call <tool> <json-kwargs>, :best-preds [csv_path], :plot_label_hist <label> [bins], :hist <label> [bins], :plot_feature_vs_label <feature> <label>, :corr_heatmap [col1,col2,...], :pareto <x_col> <y_col>")
                 continue
             if cmd == "features":
                 print("Features:", ", ".join(space.features))
@@ -175,6 +175,40 @@ def run_cli(space: SearchSpace, cfg: ChatConfig):
                     except Exception:
                         print(result.to_json())
                 continue
+            # Plot label histogram (and alias :hist)
+            if cmd.startswith("plot_label_hist") or cmd.startswith("hist"):
+                # Usage:
+                #   :plot_label_hist <label> [bins]
+                #   :hist <label> [bins]
+                parts = user.split()
+                if len(parts) < 2:
+                    print("Usage: :plot_label_hist <label> [bins]")
+                    continue
+                label = parts[1]
+                bins = 30
+                if len(parts) >= 3:
+                    try:
+                        bins = int(parts[2])
+                    except Exception:
+                        print("bins must be an integer; using default 30")
+                        bins = 30
+                csv_path = str(Path(space.df.attrs.get('source', '') or '').resolve()) if space and getattr(space, 'df', None) is not None else ''
+                if not csv_path:
+                    print("No CSV path detected. Ensure you launched with --scope <csv>.")
+                    continue
+                result = _call_tool("plot_label_hist", csv_path=csv_path, label=label, bins=bins)
+                if result.ok and isinstance(result.data, dict):
+                    path = result.data.get("image_path") if isinstance(result.data, dict) else None
+                    if path:
+                        print(f"Saved histogram to: {path}")
+                    else:
+                        print(result.to_json())
+                else:
+                    try:
+                        print(json.dumps(result.to_json(), indent=2))
+                    except Exception:
+                        print(result.to_json())
+                continue
             if cmd == "tools":
                 tools = _list_tools()
                 if not tools:
@@ -214,6 +248,90 @@ def run_cli(space: SearchSpace, cfg: ChatConfig):
                     except Exception:
                         df_for_print = None
                     _pretty_print_best_predictions(result.data, df=df_for_print, label_cols=(space.labels if df_for_print is not None else None))
+                else:
+                    try:
+                        print(json.dumps(result.to_json(), indent=2))
+                    except Exception:
+                        print(result.to_json())
+                continue
+            # Plot feature vs label (scatter or boxplot)
+            if cmd.startswith("plot_feature_vs_label"):
+                # Usage: :plot_feature_vs_label <feature> <label>
+                parts = user.split()
+                if len(parts) < 3:
+                    print("Usage: :plot_feature_vs_label <feature> <label>")
+                    continue
+                feature = parts[1]
+                label = parts[2]
+                csv_path = str(Path(space.df.attrs.get('source', '') or '').resolve()) if space and getattr(space, 'df', None) is not None else ''
+                if not csv_path:
+                    print("No CSV path detected. Ensure you launched with --scope <csv>.")
+                    continue
+                result = _call_tool("plot_feature_vs_label", csv_path=csv_path, feature=feature, label=label)
+                if result.ok and isinstance(result.data, dict):
+                    path = result.data.get("image_path") if isinstance(result.data, dict) else None
+                    if path:
+                        print(f"Saved plot to: {path}")
+                    else:
+                        print(result.to_json())
+                else:
+                    try:
+                        print(json.dumps(result.to_json(), indent=2))
+                    except Exception:
+                        print(result.to_json())
+                continue
+
+            # Correlation heatmap (optional subset columns)
+            if cmd.startswith("corr_heatmap"):
+                # Usage:
+                #   :corr_heatmap                 -> all numeric columns
+                #   :corr_heatmap col1,col2,...   -> subset
+                parts = user.split(maxsplit=1)
+                columns = None
+                if len(parts) == 2 and parts[1].strip():
+                    raw = parts[1].strip()
+                    columns = [s.strip() for s in raw.split(',') if s.strip()]
+                csv_path = str(Path(space.df.attrs.get('source', '') or '').resolve()) if space and getattr(space, 'df', None) is not None else ''
+                if not csv_path:
+                    print("No CSV path detected. Ensure you launched with --scope <csv>.")
+                    continue
+                kwargs = {"csv_path": csv_path}
+                if columns:
+                    kwargs["columns"] = columns
+                result = _call_tool("correlation_heatmap", **kwargs)
+                if result.ok and isinstance(result.data, dict):
+                    path = result.data.get("image_path") if isinstance(result.data, dict) else None
+                    if path:
+                        print(f"Saved correlation heatmap to: {path}")
+                    else:
+                        print(result.to_json())
+                else:
+                    try:
+                        print(json.dumps(result.to_json(), indent=2))
+                    except Exception:
+                        print(result.to_json())
+                continue
+
+            # Pareto front for two objectives
+            if cmd.startswith("pareto"):
+                # Usage: :pareto <x_col> <y_col>
+                parts = user.split()
+                if len(parts) < 3:
+                    print("Usage: :pareto <x_col> <y_col>")
+                    continue
+                x_col = parts[1]
+                y_col = parts[2]
+                csv_path = str(Path(space.df.attrs.get('source', '') or '').resolve()) if space and getattr(space, 'df', None) is not None else ''
+                if not csv_path:
+                    print("No CSV path detected. Ensure you launched with --scope <csv>.")
+                    continue
+                result = _call_tool("pareto_front", csv_path=csv_path, x_col=x_col, y_col=y_col)
+                if result.ok and isinstance(result.data, dict):
+                    path = result.data.get("image_path") if isinstance(result.data, dict) else None
+                    if path:
+                        print(f"Saved Pareto plot to: {path}")
+                    else:
+                        print(result.to_json())
                 else:
                     try:
                         print(json.dumps(result.to_json(), indent=2))
