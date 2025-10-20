@@ -37,6 +37,7 @@ from dataclasses import dataclass, asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import inspect
+import json
 
 
 # ---------------- Result wrapper ---------------- #
@@ -212,6 +213,10 @@ __all__ = [
     "get_tool",
     "call_tool",
     "ensure_json_safe",
+    # REPL helpers
+    "CommandContext",
+    "handle_repl_command",
+    "_pretty_print_best_predictions",
 ]
 
 
@@ -730,4 +735,332 @@ def compare_rows(csv_path: str, row_a: int, row_b: int) -> dict:
                 "row_b": ensure_json_safe(vb),
             })
     return {"row_a": int(row_a), "row_b": int(row_b), "differences": diffs}
+
+
+# ---------------- REPL command handlers (migrated from command_utils.py) ---------------- #
+
+
+@dataclass
+class CommandContext:
+    space: Any  # SearchSpace
+    cfg: Any    # ChatConfig
+    descriptor_db: dict | None
+
+
+def _csv_path_from_space(space) -> str:
+    try:
+        return str(Path(space.df.attrs.get('source', '') or '').resolve())
+    except Exception:
+        return ''
+
+
+def _pretty_print_best_predictions(data: dict, df=None, label_cols=None) -> None:
+    def _fmt_value(v):
+        try:
+            if isinstance(v, (int, float)) and not isinstance(v, bool):
+                return f"{v:.4f}"
+            return str(v)
+        except Exception:
+            return str(v)
+
+    def _condition_cols(_df):
+        if _df is None:
+            return []
+        suffixes = ("_predicted_mean", "_predicted_variance", "_expected_improvement")
+        cols = []
+        for c in _df.columns:
+            cs = str(c)
+            if any(cs.endswith(s) for s in suffixes):
+                continue
+            if label_cols and c in label_cols:
+                continue
+            if cs.lower() == "index" or cs.startswith("Unnamed:"):
+                continue
+            cols.append(c)
+        return cols
+
+    def _fmt_row_conditions(_df, idx):
+        try:
+            if _df is None:
+                return None
+            row = _df.loc[idx] if idx in _df.index else _df.iloc[int(idx)]
+            parts = []
+            for c in _condition_cols(_df):
+                try:
+                    val = row[c]
+                    sval = f"{val:.4f}" if isinstance(val, float) else str(val)
+                except Exception:
+                    sval = "?"
+                parts.append(f"{c}={sval}")
+            return ", ".join(parts) if parts else None
+        except Exception:
+            return None
+
+    sections = [
+        ("Best predicted mean", data.get("best_predicted_mean")),
+        ("Best predicted variance (max)", data.get("best_predicted_variance")),
+        ("Best expected improvement", data.get("best_expected_improvement")),
+    ]
+    for title, entry in sections:
+        if not entry or not isinstance(entry, dict) or not entry.get("column"):
+            print(f"- {title}: not found")
+            continue
+        val = _fmt_value(entry.get("value"))
+        idx = entry.get("row_index")
+        col = entry.get("column")
+        print(f"- {title}: {val} (column: {col})")
+        conds = _fmt_row_conditions(df, idx)
+        if conds:
+            print(f"  conditions: {conds}")
+
+
+def cmd_help(ctx: CommandContext, user: str) -> None:
+    print("Commands: :help, :features, :labels, :preview, :model, :describe <feature>, :tools, :call <tool> <json-kwargs>, :best-preds [csv_path], :plot_label_hist <label> [bins], :hist <label> [bins], :plot_feature_vs_label <feature> <label>, :corr_heatmap [col1,col2,...], :pareto <x_col> <y_col>")
+
+
+def cmd_features(ctx: CommandContext, user: str) -> None:
+    print("Features:", ", ".join(ctx.space.features))
+
+
+def cmd_labels(ctx: CommandContext, user: str) -> None:
+    print("Labels:", ", ".join(ctx.space.labels) if ctx.space.labels else "(none specified)")
+
+
+def cmd_preview(ctx: CommandContext, user: str) -> None:
+    from .search_space import preview_df
+    print(preview_df(ctx.space.df, 5))
+
+
+def cmd_model(ctx: CommandContext, user: str) -> None:
+    print("Current model:", ctx.cfg.model_name)
+
+
+def cmd_describe(ctx: CommandContext, user: str) -> None:
+    parts = user.split(maxsplit=1)
+    if len(parts) == 2:
+        feat_name = parts[1].strip()
+        if ctx.descriptor_db:
+            d = ctx.descriptor_db.get(feat_name)
+            print(d if d else f"No descriptor definition for: {feat_name}")
+        else:
+            print("Descriptor DB not loaded.")
+    else:
+        print("Usage: :describe <feature>")
+
+
+def cmd_best_preds(ctx: CommandContext, user: str) -> None:
+    parts = user.split(maxsplit=1)
+    if len(parts) == 2:
+        csv_path = parts[1].strip()
+    else:
+        csv_path = _csv_path_from_space(ctx.space)
+    if not csv_path:
+        print("No CSV path detected. Provide one: :best-preds /path/to/predictions.csv")
+        return
+    result = call_tool("best_predictions", csv_path=csv_path)
+    if result.ok and isinstance(result.data, dict):
+        _pretty_print_best_predictions(result.data, df=ctx.space.df, label_cols=ctx.space.labels)
+    else:
+        try:
+            print(json.dumps(result.to_json(), indent=2))
+        except Exception:
+            print(result.to_json())
+
+
+def cmd_tools(ctx: CommandContext, user: str) -> None:
+    tools = list_tools()
+    if not tools:
+        print("No tools registered.")
+    else:
+        for t in tools:
+            name = t.get("name", "?")
+            desc = t.get("description", "")
+            print(f"- {name}: {desc}")
+
+
+def cmd_call(ctx: CommandContext, user: str) -> None:
+    parts = user.split(maxsplit=2)
+    if len(parts) < 2:
+        print("Usage: :call <tool> <json-kwargs>")
+        return
+    tool_name = parts[1]
+    kwargs = {}
+    if len(parts) == 3:
+        json_arg = parts[2]
+        try:
+            kwargs = json.loads(json_arg)
+            if not isinstance(kwargs, dict):
+                print("Error: JSON kwargs must be an object, e.g., {\"csv_path\": \"/path/file.csv\"}")
+                return
+        except Exception as e:
+            print(f"JSON parse error: {e}")
+            return
+    result = call_tool(tool_name, **kwargs)
+    if tool_name == "best_predictions" and result.ok and isinstance(result.data, dict):
+        src = ctx.space.df.attrs.get('source') if getattr(ctx.space, 'df', None) is not None else None
+        csv_kw = kwargs.get('csv_path') if isinstance(kwargs, dict) else None
+        df_for_print = None
+        try:
+            if src and csv_kw and Path(src).resolve() == Path(csv_kw).resolve():
+                df_for_print = ctx.space.df
+        except Exception:
+            df_for_print = None
+        _pretty_print_best_predictions(result.data, df=df_for_print, label_cols=(ctx.space.labels if df_for_print is not None else None))
+    else:
+        try:
+            print(json.dumps(result.to_json(), indent=2))
+        except Exception:
+            print(result.to_json())
+
+
+def cmd_plot_label_hist(ctx: CommandContext, user: str) -> None:
+    parts = user.split()
+    if len(parts) < 2:
+        print("Usage: :plot_label_hist <label> [bins]")
+        return
+    label = parts[1]
+    bins = 30
+    if len(parts) >= 3:
+        try:
+            bins = int(parts[2])
+        except Exception:
+            print("bins must be an integer; using default 30")
+            bins = 30
+    csv_path = _csv_path_from_space(ctx.space)
+    if not csv_path:
+        print("No CSV path detected. Ensure you launched with --scope <csv>.")
+        return
+    result = call_tool("plot_label_hist", csv_path=csv_path, label=label, bins=bins)
+    if result.ok and isinstance(result.data, dict):
+        path = result.data.get("image_path") if isinstance(result.data, dict) else None
+        if path:
+            print(f"Saved histogram to: {path}")
+        else:
+            print(result.to_json())
+    else:
+        try:
+            print(json.dumps(result.to_json(), indent=2))
+        except Exception:
+            print(result.to_json())
+
+
+def cmd_plot_feature_vs_label(ctx: CommandContext, user: str) -> None:
+    parts = user.split()
+    if len(parts) < 3:
+        print("Usage: :plot_feature_vs_label <feature> <label>")
+        return
+    feature = parts[1]
+    label = parts[2]
+    csv_path = _csv_path_from_space(ctx.space)
+    if not csv_path:
+        print("No CSV path detected. Ensure you launched with --scope <csv>.")
+        return
+    result = call_tool("plot_feature_vs_label", csv_path=csv_path, feature=feature, label=label)
+    if result.ok and isinstance(result.data, dict):
+        path = result.data.get("image_path") if isinstance(result.data, dict) else None
+        if path:
+            print(f"Saved plot to: {path}")
+        else:
+            print(result.to_json())
+    else:
+        try:
+            print(json.dumps(result.to_json(), indent=2))
+        except Exception:
+            print(result.to_json())
+
+
+def cmd_corr_heatmap(ctx: CommandContext, user: str) -> None:
+    parts = user.split(maxsplit=1)
+    columns = None
+    if len(parts) == 2 and parts[1].strip():
+        raw = parts[1].strip()
+        columns = [s.strip() for s in raw.split(',') if s.strip()]
+    csv_path = _csv_path_from_space(ctx.space)
+    if not csv_path:
+        print("No CSV path detected. Ensure you launched with --scope <csv>.")
+        return
+    kwargs = {"csv_path": csv_path}
+    if columns:
+        kwargs["columns"] = columns
+    result = call_tool("correlation_heatmap", **kwargs)
+    if result.ok and isinstance(result.data, dict):
+        path = result.data.get("image_path") if isinstance(result.data, dict) else None
+        if path:
+            print(f"Saved correlation heatmap to: {path}")
+        else:
+            print(result.to_json())
+    else:
+        try:
+            print(json.dumps(result.to_json(), indent=2))
+        except Exception:
+            print(result.to_json())
+
+
+def cmd_pareto(ctx: CommandContext, user: str) -> None:
+    parts = user.split()
+    if len(parts) < 3:
+        print("Usage: :pareto <x_col> <y_col>")
+        return
+    x_col = parts[1]
+    y_col = parts[2]
+    csv_path = _csv_path_from_space(ctx.space)
+    if not csv_path:
+        print("No CSV path detected. Ensure you launched with --scope <csv>.")
+        return
+    result = call_tool("pareto_front", csv_path=csv_path, x_col=x_col, y_col=y_col)
+    if result.ok and isinstance(result.data, dict):
+        path = result.data.get("image_path") if isinstance(result.data, dict) else None
+        if path:
+            print(f"Saved Pareto plot to: {path}")
+        else:
+            print(result.to_json())
+    else:
+        try:
+            print(json.dumps(result.to_json(), indent=2))
+        except Exception:
+            print(result.to_json())
+
+
+def handle_repl_command(ctx: CommandContext, user: str) -> bool:
+    cmd = user[1:].strip().lower()
+    if cmd == "help":
+        cmd_help(ctx, user)
+        return True
+    if cmd == "features":
+        cmd_features(ctx, user)
+        return True
+    if cmd == "labels":
+        cmd_labels(ctx, user)
+        return True
+    if cmd == "preview":
+        cmd_preview(ctx, user)
+        return True
+    if cmd == "model":
+        cmd_model(ctx, user)
+        return True
+    if cmd.startswith("describe"):
+        cmd_describe(ctx, user)
+        return True
+    if cmd.startswith("best-preds"):
+        cmd_best_preds(ctx, user)
+        return True
+    if cmd == "tools":
+        cmd_tools(ctx, user)
+        return True
+    if cmd.startswith("call"):
+        cmd_call(ctx, user)
+        return True
+    if cmd.startswith("plot_label_hist") or cmd.startswith("hist"):
+        cmd_plot_label_hist(ctx, user)
+        return True
+    if cmd.startswith("plot_feature_vs_label"):
+        cmd_plot_feature_vs_label(ctx, user)
+        return True
+    if cmd.startswith("corr_heatmap"):
+        cmd_corr_heatmap(ctx, user)
+        return True
+    if cmd.startswith("pareto"):
+        cmd_pareto(ctx, user)
+        return True
+    return False
 

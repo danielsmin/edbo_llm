@@ -33,6 +33,7 @@ def _find_project_root(start: Path) -> Path:
     return Path(start).resolve()
 from .descriptors import load_descriptor_db
 from .utils import list_tools as _list_tools, call_tool as _call_tool
+from .utils import CommandContext, handle_repl_command
 
 try:
     from . import rag as ragmod
@@ -52,11 +53,7 @@ def _is_code_request(text: str) -> bool:
 
 
 def run_cli(space: SearchSpace, cfg: ChatConfig):
-    """Run an interactive chat loop over the provided search space and config.
-
-    - "space" holds the features/labels and preview of the loaded CSV.
-    - "cfg" selects the LLM provider/model and runtime generation settings.
-    """
+    """Run an interactive chat loop over the provided search space and config."""
     # Permanently suppress HuggingFace tokenizers parallelism fork warnings
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     backend = build_backend(cfg)  # pick OpenAI or Gemini backend
@@ -80,38 +77,35 @@ def run_cli(space: SearchSpace, cfg: ChatConfig):
     if cfg.rag_enable and RAG_AVAILABLE and ragmod is not None:
         root = _find_project_root(Path(__file__).parent)
         persist_dir = root / ".chroma"  # on-disk vector cache
-        client = ragmod.get_client(persist_dir)
-        embedder = ragmod.Embedder()  # sentence-transformers/all-MiniLM-L6-v2
-        print(f"RAG: enabled (persist at {persist_dir})")
         try:
-            # Index a subset of repo code for helpful context
-            added_code = ragmod.ingest_codebase(
-                client, embedder, root, include_dirs=[root / "edbo" / "plus"]
-            )
-            print(f"RAG: indexed code chunks: {added_code}")
+            client = ragmod.get_client(persist_dir)
+            embedder = ragmod.Embedder()  # sentence-transformers/all-MiniLM-L6-v2
+            print(f"RAG: enabled (persist at {persist_dir})")
+            try:
+                added_code = ragmod.ingest_codebase(
+                    client, embedder, root, include_dirs=[root / "edbo" / "plus"]
+                )
+                print(f"RAG: indexed code chunks: {added_code}")
+            except Exception:
+                pass
+            try:
+                added_csv = ragmod.ingest_csv_columns(
+                    client,
+                    embedder,
+                    space.df,
+                    Path(space.df.attrs.get('source', 'dataset.csv')),
+                    descriptor_lookup=descriptor_db,
+                )
+                print(f"RAG: indexed CSV column docs: {added_csv}")
+            except Exception:
+                pass
+            try:
+                nb_path = root / "tutorials" / "1_CLI_example.ipynb"
+                added_nb = ragmod.ingest_ipynb(client, embedder, root, nb_path)
+                print(f"RAG: indexed tutorial cells: {added_nb}")
+            except Exception:
+                pass
         except Exception:
-            pass
-        try:
-            # Summaries of each CSV column (names, samples, basic stats)
-            added_csv = ragmod.ingest_csv_columns(
-                client,
-                embedder,
-                space.df,
-                Path(space.df.attrs.get('source', 'dataset.csv')),
-                descriptor_lookup=descriptor_db,
-            )
-            print(f"RAG: indexed CSV column docs: {added_csv}")
-        except Exception:
-            pass
-        try:
-            # Optional: index tutorial notebook cells
-            nb_path = root / "tutorials" / "1_CLI_example.ipynb"
-            added_nb = ragmod.ingest_ipynb(client, embedder, root, nb_path)
-            print(f"RAG: indexed tutorial cells: {added_nb}")
-        except Exception:
-            pass
-    else:
-        if cfg.rag_enable:
             print("RAG: unavailable (install chromadb and sentence-transformers), proceeding without retrieval.")
 
     while True:
@@ -124,219 +118,9 @@ def run_cli(space: SearchSpace, cfg: ChatConfig):
             print("Goodbye.")
             break
         if user.startswith(":"):
-            cmd = user[1:].strip().lower()
-            if cmd == "help":
-                # Lightweight REPL commands for quick inspection
-                print("Commands: :help, :features, :labels, :preview, :model, :describe <feature>, :tools, :call <tool> <json-kwargs>, :best-preds [csv_path], :plot_label_hist <label> [bins], :hist <label> [bins], :plot_feature_vs_label <feature> <label>, :corr_heatmap [col1,col2,...], :pareto <x_col> <y_col>")
-                continue
-            if cmd == "features":
-                print("Features:", ", ".join(space.features))
-                continue
-            if cmd == "labels":
-                print("Labels:", ", ".join(space.labels) if space.labels else "(none specified)")
-                continue
-            if cmd == "preview":
-                print(preview_df(space.df, 5))
-                continue
-            if cmd == "model":
-                print("Current model:", cfg.model_name)
-                continue
-            if cmd.startswith("describe"):
-                parts = user.split(maxsplit=1)
-                if len(parts) == 2:
-                    feat_name = parts[1].strip()
-                    if descriptor_db:
-                        d = descriptor_db.get(feat_name)
-                        print(d if d else f"No descriptor definition for: {feat_name}")
-                    else:
-                        print("Descriptor DB not loaded.")
-                else:
-                    print("Usage: :describe <feature>")
-                continue
-            if cmd.startswith("best-preds"):
-                # Convenience wrapper around the registered 'best_predictions' tool.
-                # Usage:
-                #   :best-preds                 -> uses current scope CSV if available
-                #   :best-preds /path/to.csv    -> uses provided path
-                parts = user.split(maxsplit=1)
-                if len(parts) == 2:
-                    csv_path = parts[1].strip()
-                else:
-                    csv_path = str(Path(space.df.attrs.get('source', '') or '').resolve()) if space and getattr(space, 'df', None) is not None else ''
-                if not csv_path:
-                    print("No CSV path detected. Provide one: :best-preds /path/to/predictions.csv")
-                    continue
-                result = _call_tool("best_predictions", csv_path=csv_path)
-                if result.ok and isinstance(result.data, dict):
-                    _pretty_print_best_predictions(result.data, df=space.df, label_cols=space.labels)
-                else:
-                    try:
-                        print(json.dumps(result.to_json(), indent=2))
-                    except Exception:
-                        print(result.to_json())
-                continue
-            # Plot label histogram (and alias :hist)
-            if cmd.startswith("plot_label_hist") or cmd.startswith("hist"):
-                # Usage:
-                #   :plot_label_hist <label> [bins]
-                #   :hist <label> [bins]
-                parts = user.split()
-                if len(parts) < 2:
-                    print("Usage: :plot_label_hist <label> [bins]")
-                    continue
-                label = parts[1]
-                bins = 30
-                if len(parts) >= 3:
-                    try:
-                        bins = int(parts[2])
-                    except Exception:
-                        print("bins must be an integer; using default 30")
-                        bins = 30
-                csv_path = str(Path(space.df.attrs.get('source', '') or '').resolve()) if space and getattr(space, 'df', None) is not None else ''
-                if not csv_path:
-                    print("No CSV path detected. Ensure you launched with --scope <csv>.")
-                    continue
-                result = _call_tool("plot_label_hist", csv_path=csv_path, label=label, bins=bins)
-                if result.ok and isinstance(result.data, dict):
-                    path = result.data.get("image_path") if isinstance(result.data, dict) else None
-                    if path:
-                        print(f"Saved histogram to: {path}")
-                    else:
-                        print(result.to_json())
-                else:
-                    try:
-                        print(json.dumps(result.to_json(), indent=2))
-                    except Exception:
-                        print(result.to_json())
-                continue
-            if cmd == "tools":
-                tools = _list_tools()
-                if not tools:
-                    print("No tools registered.")
-                else:
-                    for t in tools:
-                        name = t.get("name", "?")
-                        desc = t.get("description", "")
-                        print(f"- {name}: {desc}")
-                continue
-            if cmd.startswith("call"):
-                parts = user.split(maxsplit=2)
-                if len(parts) < 2:
-                    print("Usage: :call <tool> <json-kwargs>")
-                    continue
-                tool_name = parts[1]
-                kwargs = {}
-                if len(parts) == 3:
-                    json_arg = parts[2]
-                    try:
-                        kwargs = json.loads(json_arg)
-                        if not isinstance(kwargs, dict):
-                            print("Error: JSON kwargs must be an object, e.g., {\"csv_path\": \"/path/file.csv\"}")
-                            continue
-                    except Exception as e:
-                        print(f"JSON parse error: {e}")
-                        continue
-                result = _call_tool(tool_name, **kwargs)
-                # Pretty-print known tools
-                if tool_name == "best_predictions" and result.ok and isinstance(result.data, dict):
-                    df_for_print = None
-                    try:
-                        src = space.df.attrs.get('source') if getattr(space, 'df', None) is not None else None
-                        csv_kw = kwargs.get('csv_path') if isinstance(kwargs, dict) else None
-                        if src and csv_kw and Path(src).resolve() == Path(csv_kw).resolve():
-                            df_for_print = space.df
-                    except Exception:
-                        df_for_print = None
-                    _pretty_print_best_predictions(result.data, df=df_for_print, label_cols=(space.labels if df_for_print is not None else None))
-                else:
-                    try:
-                        print(json.dumps(result.to_json(), indent=2))
-                    except Exception:
-                        print(result.to_json())
-                continue
-            # Plot feature vs label (scatter or boxplot)
-            if cmd.startswith("plot_feature_vs_label"):
-                # Usage: :plot_feature_vs_label <feature> <label>
-                parts = user.split()
-                if len(parts) < 3:
-                    print("Usage: :plot_feature_vs_label <feature> <label>")
-                    continue
-                feature = parts[1]
-                label = parts[2]
-                csv_path = str(Path(space.df.attrs.get('source', '') or '').resolve()) if space and getattr(space, 'df', None) is not None else ''
-                if not csv_path:
-                    print("No CSV path detected. Ensure you launched with --scope <csv>.")
-                    continue
-                result = _call_tool("plot_feature_vs_label", csv_path=csv_path, feature=feature, label=label)
-                if result.ok and isinstance(result.data, dict):
-                    path = result.data.get("image_path") if isinstance(result.data, dict) else None
-                    if path:
-                        print(f"Saved plot to: {path}")
-                    else:
-                        print(result.to_json())
-                else:
-                    try:
-                        print(json.dumps(result.to_json(), indent=2))
-                    except Exception:
-                        print(result.to_json())
-                continue
-
-            # Correlation heatmap (optional subset columns)
-            if cmd.startswith("corr_heatmap"):
-                # Usage:
-                #   :corr_heatmap                 -> all numeric columns
-                #   :corr_heatmap col1,col2,...   -> subset
-                parts = user.split(maxsplit=1)
-                columns = None
-                if len(parts) == 2 and parts[1].strip():
-                    raw = parts[1].strip()
-                    columns = [s.strip() for s in raw.split(',') if s.strip()]
-                csv_path = str(Path(space.df.attrs.get('source', '') or '').resolve()) if space and getattr(space, 'df', None) is not None else ''
-                if not csv_path:
-                    print("No CSV path detected. Ensure you launched with --scope <csv>.")
-                    continue
-                kwargs = {"csv_path": csv_path}
-                if columns:
-                    kwargs["columns"] = columns
-                result = _call_tool("correlation_heatmap", **kwargs)
-                if result.ok and isinstance(result.data, dict):
-                    path = result.data.get("image_path") if isinstance(result.data, dict) else None
-                    if path:
-                        print(f"Saved correlation heatmap to: {path}")
-                    else:
-                        print(result.to_json())
-                else:
-                    try:
-                        print(json.dumps(result.to_json(), indent=2))
-                    except Exception:
-                        print(result.to_json())
-                continue
-
-            # Pareto front for two objectives
-            if cmd.startswith("pareto"):
-                # Usage: :pareto <x_col> <y_col>
-                parts = user.split()
-                if len(parts) < 3:
-                    print("Usage: :pareto <x_col> <y_col>")
-                    continue
-                x_col = parts[1]
-                y_col = parts[2]
-                csv_path = str(Path(space.df.attrs.get('source', '') or '').resolve()) if space and getattr(space, 'df', None) is not None else ''
-                if not csv_path:
-                    print("No CSV path detected. Ensure you launched with --scope <csv>.")
-                    continue
-                result = _call_tool("pareto_front", csv_path=csv_path, x_col=x_col, y_col=y_col)
-                if result.ok and isinstance(result.data, dict):
-                    path = result.data.get("image_path") if isinstance(result.data, dict) else None
-                    if path:
-                        print(f"Saved Pareto plot to: {path}")
-                    else:
-                        print(result.to_json())
-                else:
-                    try:
-                        print(json.dumps(result.to_json(), indent=2))
-                    except Exception:
-                        print(result.to_json())
+            # Delegate REPL commands to command_utils
+            ctx = CommandContext(space=space, cfg=cfg, descriptor_db=descriptor_db)
+            if handle_repl_command(ctx, user):
                 continue
         # Build the user/task context
         feat = infer_feature_mention(user, space.features)
@@ -412,72 +196,6 @@ def main():
     )
     run_cli(space, cfg)
 
-def _pretty_print_best_predictions(data: dict, df=None, label_cols=None) -> None:
-    """Print a human-readable summary for the best_predictions tool output.
-
-    If a DataFrame is provided, also render reaction conditions (all columns
-    excluding prediction/label columns) for the selected rows.
-    """
-    def _fmt_value(v):
-        try:
-            # Format numbers nicely, otherwise fallback to str
-            if isinstance(v, (int, float)):
-                return f"{v:.4f}" if not isinstance(v, bool) else str(v)
-            return str(v)
-        except Exception:
-            return str(v)
-
-    def _condition_cols(_df):
-        if _df is None:
-            return []
-        suffixes = ("_predicted_mean", "_predicted_variance", "_expected_improvement")
-        cols = []
-        for c in _df.columns:
-            cs = str(c)
-            if any(cs.endswith(s) for s in suffixes):
-                continue
-            if label_cols and c in label_cols:
-                continue
-            if cs.lower() == "index" or cs.startswith("Unnamed:"):
-                continue
-            cols.append(c)
-        return cols
-
-    def _fmt_row_conditions(_df, idx):
-        try:
-            if _df is None:
-                return None
-            # Access row by label index if present else positional
-            if idx in _df.index:
-                row = _df.loc[idx]
-            else:
-                row = _df.iloc[int(idx)]
-            parts = []
-            for c in _condition_cols(_df):
-                try:
-                    val = row[c]
-                    sval = f"{val:.4f}" if isinstance(val, float) else str(val)
-                except Exception:
-                    sval = "?"
-                parts.append(f"{c}={sval}")
-            return ", ".join(parts) if parts else None
-        except Exception:
-            return None
-
-    sections = [
-        ("Best predicted mean", data.get("best_predicted_mean")),
-        ("Best predicted variance (max)", data.get("best_predicted_variance")),
-        ("Best expected improvement", data.get("best_expected_improvement")),
-    ]
-    for title, entry in sections:
-        if not entry or not isinstance(entry, dict) or not entry.get("column"):
-            print(f"- {title}: not found")
-            continue
-        val = _fmt_value(entry.get("value"))
-        idx = entry.get("row_index")
-        col = entry.get("column")
-        # Print without raw row number; show conditions when possible
-        print(f"- {title}: {val} (column: {col})")
-        conds = _fmt_row_conditions(df, idx)
-        if conds:
-            print(f"  conditions: {conds}")
+def _pretty_print_best_predictions(*args, **kwargs):  # Backward shim if imported elsewhere
+    from .utils import _pretty_print_best_predictions as _pp
+    return _pp(*args, **kwargs)
