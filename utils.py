@@ -220,27 +220,7 @@ __all__ = [
 ]
 
 
-# ---------------- Example tool (one only) ---------------- #
-
-
-@register_tool(
-    description="Echo back the provided text",
-    input_schema={
-        "type": "object",
-        "properties": {"text": {"type": "string"}},
-        "required": ["text"],
-    },
-    output_schema={
-        "type": "object",
-        "properties": {"text": {"type": "string"}},
-    },
-)
-def echo(text: str) -> dict:
-    """Return the provided text in a JSON object.
-
-    Useful as a template for adding new chatbot-callable tools.
-    """
-    return {"text": str(text)}
+# (Removed example 'echo' tool for brevity)
 
 
 # ---------------- Domain tool: predictions summary ---------------- #

@@ -13,12 +13,11 @@ model abstractions, RAG utilities, and prompt builders live in siblings.
 
 import argparse
 import os
-import json
 from pathlib import Path
 
 from .config import ChatConfig  # runtime settings for the chat session
 from .backends import build_backend, GeminiBackend  # model adapters
-from .search_space import SearchSpace, preview_df  # CSV loader + convenience preview
+from .search_space import SearchSpace  # CSV loader
 from .prompting import (
     ASSISTANT_INSTRUCTIONS,  # stable system prompt with guardrails
     build_user_prompt,       # formats the user request with context
@@ -32,7 +31,6 @@ def _find_project_root(start: Path) -> Path:
         p = p.parent
     return Path(start).resolve()
 from .descriptors import load_descriptor_db
-from .utils import list_tools as _list_tools, call_tool as _call_tool
 from .utils import CommandContext, handle_repl_command
 
 try:
@@ -43,13 +41,8 @@ except Exception:
     RAG_AVAILABLE = False
 
 
-def _is_code_request(text: str) -> bool:
-    """Heuristic: does the user appear to ask for code?
-
-    Used to tweak generation limits (e.g., give Gemini more tokens for code).
-    """
-    t = text.lower()
-    return any(w in t for w in ["code", "snippet", "example", "write code"]) and not t.startswith(":")
+#
+# Note: Code-request heuristics are handled inline in run_cli for simplicity.
 
 
 def run_cli(space: SearchSpace, cfg: ChatConfig):
